@@ -1,16 +1,23 @@
 import faunadb from "faunadb"
 import type * as Fauna from "faunadb"
 import { createHash, randomBytes } from "crypto"
-import type { User, Profile } from "next-auth"
 import type { Adapter } from "next-auth/adapters"
 
-/**
- * Define Session interface here since the built-in next-auth Session interface
- * refers more closely to the client-side types than the server-side ones.
- *
- * ['DefaultSession'](https://github.com/nextauthjs/next-auth/blob/main/types/index.d.ts#L379)
- */
-interface FaunaSession {
+interface FaunaTime {
+  value: string
+}
+interface User {
+  id: string
+  emailVerified: Date | null
+  name?: string
+  email?: string
+  image?: string
+}
+
+interface Profile extends User {
+  sub?: string
+}
+interface Session {
   id: string
   userId: string
   expires: Date
@@ -18,19 +25,36 @@ interface FaunaSession {
   accessToken: string
 }
 
-interface FaunaResult {
-  ref: string
-  data: object
+interface VerificationRequest {
+  id: string
+  identifier: string
+  token: string
+  expires: Date
 }
 
-type FaunaResultOrNull = FaunaResult | { ref: null; data: null }
+interface FaunaUser {
+  ref: string | null
+  data:
+    | (Omit<User, "emailVerified"> & { emailVerified: FaunaTime | null })
+    | null
+}
+
+interface FaunaSession {
+  ref: string | null
+  data: (Omit<Session, "expires"> & { expires: FaunaTime }) | null
+}
+
+interface FaunaVerificationRequest {
+  ref: string | null
+  data: (Omit<VerificationRequest, "expires"> & { expires: FaunaTime }) | null
+}
 
 export const FaunaAdapter: Adapter<
   Fauna.Client,
   never,
-  User & { id: string; emailVerified?: Date },
-  Profile & { emailVerified?: Date },
-  FaunaSession
+  User,
+  Profile,
+  Session
 > = (fauna) => {
   const {
     Create,
@@ -50,6 +74,47 @@ export const FaunaAdapter: Adapter<
     Update,
   } = faunadb.query
 
+  const fqlTemplates = {
+    doOnRef: (collection: string, ref: Fauna.ExprArg, fql: Fauna.Expr) =>
+      Let(
+        {
+          /**
+           */
+          ref: Ref(Collection(collection), ref),
+        },
+        /**
+         */
+        If(Exists(Var("ref")), fql, { ref: null, data: null })
+      ),
+    doOnIndex: (index: string, terms: string[], fql: Fauna.Expr) =>
+      Let(
+        {
+          /**
+           */
+          set: Match(Index(index), terms),
+        },
+        /**
+         */
+        If(
+          Exists(Var("set")),
+          Let(
+            {
+              /**
+               */
+              ref: Select(0, Paginate(Var("set"))),
+            },
+            /**
+             */
+            If(Exists(Var("ref")), fql, {
+              ref: null,
+              data: null,
+            })
+          ),
+          { ref: null, data: null }
+        )
+      ),
+  }
+
   const collections = {
     User: "users",
     Account: "accounts",
@@ -64,32 +129,30 @@ export const FaunaAdapter: Adapter<
     VerificationRequest: "verification_request_by_token",
   }
 
-  const dateToFaunaTimeOrNull = (date: Date | undefined) =>
+  const dateToFaunaTimeOrNull = (date: Date | null) =>
     date ? Time(date.toISOString()) : null
 
-  const faunaTimeToDateOrNull = (faunaTime: { value: string }) =>
+  const faunaTimeToDateOrNull = (faunaTime: FaunaTime | null) =>
     faunaTime ? new Date(faunaTime.value) : null
 
   const reshape = {
-    user: (ref: string, user: object) => ({
+    user: ({ ref, data: user }: FaunaUser): User => ({
       ...user,
       id: ref,
       emailVerified: faunaTimeToDateOrNull(user.emailVerified),
     }),
-    account: (ref: string, account: object) => ({
-      ...account,
-      id: ref,
-      accessTokenExpires: faunaTimeToDateOrNull(account.accessTokenExpires),
-    }),
-    session: (ref: string, session: object) => ({
+    session: ({ ref, data: session }: FaunaSession): Session => ({
       ...session,
       id: ref,
-      expires: new Date(session.expires.value),
+      expires: faunaTimeToDateOrNull(session.expires),
     }),
-    verificationRequest: (ref: string, verificationRequest: object) => ({
+    verificationRequest: ({
+      ref,
+      data: verificationRequest,
+    }: FaunaVerificationRequest): VerificationRequest => ({
       ...verificationRequest,
       id: ref,
-      expires: faunaTimeToDateOrNull(verificationRequest.expires.value),
+      expires: faunaTimeToDateOrNull(verificationRequest.expires),
     }),
   }
 
@@ -107,11 +170,7 @@ export const FaunaAdapter: Adapter<
 
       return {
         async createUser(profile) {
-          const { ref, data: user } = await fauna.query<FaunaResult>(
-            /**
-             * Create a new user document within the users collection.
-             * The user document is populated with data from the profile.
-             */
+          const result = await fauna.query<FaunaUserResult>(
             Create(Collection(collections.User), {
               data: {
                 name: profile.name,
@@ -122,183 +181,77 @@ export const FaunaAdapter: Adapter<
             })
           )
 
-          return reshape.user(ref, user)
+          if (!result.ref || !result.data) return null
+
+          return reshape.user(result)
         },
 
         async getUser(id) {
-          const { ref, data: user } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `ref`, which holds a reference to the user's
-                 * fauna document within the users collection.
-                 *
-                 * The passed user id was set to the value of the user's fauna document
-                 * reference upon creation.
-                 *
-                 * In this way, the user id is used to retrieve the user's fauna document.
-                 *
-                 * (i.e. user's fauna document reference == user id)
-                 */
-                ref: Ref(Collection(collections.User), id),
-              },
-              /**
-               * Then, if the reference points to a valid user document, get that document.
-               * Else, return a nullish return object.
-               */
-              If(Exists(Var("ref")), Get(Var("ref")), { ref: null, data: null })
-            )
+          const result = await fauna.query<FaunaUserResult>(
+            fqlTemplates.doOnRef(collections.User, id, Get(Var("ref")))
           )
 
-          if (!ref || !user) return null
+          if (!result.ref || !result.data) return null
 
-          return reshape.user(ref, user)
+          return reshape.user(result)
         },
 
         async getUserByEmail(email) {
-          /**
-           * If no email is provided, then we cannot continue.
-           * Hence, return null.
-           */
           if (!email) return null
 
-          const { ref, data: user } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `set` which holds a set of matches against
-                 * the 'user_by_email' index.
-                 *
-                 * The passed in email is used as the search term.
-                 */
-                set: Match(Index(indices.User), email),
-              },
-              /**
-               * Then, if a member of the set holds a reference to a valid user document, get that document.
-               * Else, return a nullish return object.
-               */
-              If(Exists(Var("set")), Get(Var("set")), { ref: null, data: null })
-            )
+          const result = await fauna.query<FaunaUserResult>(
+            fqlTemplates.doOnIndex(indices.User, [email], Get(Var("ref")))
           )
 
-          if (!ref || !user) return null
+          if (!result.ref || !result.data) return null
 
-          return reshape.user(ref, user)
+          return reshape.user(result)
         },
 
         async getUserByProviderAccountId(providerId, providerAccountId) {
-          const { ref, data: user } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `accountSet` which holds a set of matches against
-                 * the 'account_by_provider_account_id' index.
-                 *
-                 * The passed in providerId and providerAccountId together form the search terms.
-                 */
-                accountSet: Match(Index(indices.Account), [
-                  providerId,
-                  providerAccountId,
-                ]),
-              },
-              /**
-               * Then, if a member of the set holds a reference to a valid account document, continue.
-               * Else, return a nullish return object.
-               */
-              If(
-                Exists(Var("accountSet")),
-                Let(
-                  {
-                    /**
-                     * Define a local fauna variable `userRef` which holds a document reference to
-                     * the user's fauna document as determined by the 'userId' of the account document.
-                     *
-                     * Once again we rely on the fact that the user's fauna document reference
-                     * equals the user's id.
-                     */
-                    userRef: Ref(
-                      Collection("users"),
-                      Select(["data", "userId"], Get(Var("accountSet")))
-                    ),
-                  },
-                  /**
-                   * Then, if the reference points to a valid user document, get that document.
-                   * Else, return a nullish return object.
-                   */
-                  If(Exists(Var("userRef")), Get(Var("userRef")), {
-                    ref: null,
-                    data: null,
-                  })
-                ),
-                { ref: null, data: null }
+          const result = await fauna.query<FaunaUserResult>(
+            fqlTemplates.doOnIndex(
+              indices.Account,
+              [providerId, providerAccountId],
+              fqlTemplates.doOnRef(
+                indices.User,
+                Select(["data", "userId"], Get(Var("ref"))),
+                Get(Var("ref"))
               )
             )
           )
 
-          if (!ref || !user) return null
+          if (!result.ref || !result.data) return null
 
-          return reshape.user(ref, user)
+          return reshape.user(result)
         },
 
         async updateUser(user) {
-          const { ref, data: newUser } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `ref`, which holds a reference to the user's
-                 * fauna document within the users collection.
-                 */
-                ref: Ref(Collection(collections.User), user.id),
-              },
-              /**
-               * Then, if the reference points to a valid user document, update that document
-               * to match the values of the passed in user object.
-               * Else, return a nullish return object.
-               */
-              If(
-                Exists(Var("ref")),
-                Update(Var("ref"), {
-                  data: {
-                    name: user.name,
-                    email: user.email,
-                    image: user.image,
-                    emailVerified: dateToFaunaTimeOrNull(user.emailVerified),
-                  },
-                }),
-                { ref: null, data: null }
-              )
-            )
-          )
-
-          if (!ref || !newUser) return null
-
-          return reshape.user(ref, newUser)
-        },
-
-        async deleteUser(userId) {
-          const { ref, data: user } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `ref`, which holds a reference to the user's
-                 * fauna document within the users collection.
-                 */
-                ref: Ref(Collection(collections.User), userId),
-              },
-              /**
-               * Then, if the reference points to a valid user document, delete that document.
-               * Else, return a nullish return object.
-               */
-              If(Exists(Var("ref")), Delete(Var("ref")), {
-                ref: null,
-                data: null,
+          const result = await fauna.query<FaunaUserResult>(
+            fqlTemplates.doOnRef(
+              collections.User,
+              user.id,
+              Update(Var("ref"), {
+                data: {
+                  name: user.name,
+                  email: user.email,
+                  image: user.image,
+                  emailVerified: dateToFaunaTimeOrNull(user.emailVerified),
+                },
               })
             )
           )
 
-          if (!ref || !user) return null
+          if (!result.ref || !result.data) return null
 
-          return reshape.user(ref, user)
+          return reshape.user(result)
+        },
+
+        async deleteUser(userId) {
+          await fauna.query<FaunaUserResult>(
+            fqlTemplates.doOnRef(collections.User, userId, Delete(Var("ref")))
+          )
+          return null
         },
 
         async linkAccount(
@@ -310,11 +263,7 @@ export const FaunaAdapter: Adapter<
           accessToken,
           accessTokenExpires
         ) {
-          const { ref, data: account } = await fauna.query<FaunaResult>(
-            /**
-             * Create a new account document within the accounts collection.
-             * The account document is populated with the passed in parameters.
-             */
+          await fauna.query<FaunaResult>(
             Create(Collection(collections.Account), {
               data: {
                 userId,
@@ -328,68 +277,23 @@ export const FaunaAdapter: Adapter<
             })
           )
 
-          return reshape.account(ref, account)
+          return null
         },
 
         async unlinkAccount(_, providerId, providerAccountId) {
-          const { ref, data: account } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `set` which holds a set of matches against
-                 * the 'account_by_provider_account_id' index.
-                 *
-                 * The passed in providerId and providerAccountId together form the search terms.
-                 */
-                set: Match(Index(indices.Account), [
-                  providerId,
-                  providerAccountId,
-                ]),
-              },
-              /**
-               * Then, if a member of the set holds a reference to a valid account document, continue.
-               * Else, return a nullish return object.
-               */
-              If(
-                Exists(Var("set")),
-                Let(
-                  {
-                    /**
-                     * Define a local fauna variable `ref` which holds a reference to the account's
-                     * fauna document.
-                     *
-                     * We select the first document reference within the index matches set.
-                     */
-                    ref: Select(0, Paginate(Var("set"))),
-                  },
-                  /**
-                   * Then, if the reference points to a valid user document, delete that document.
-                   * Else, return a nullish return object.
-                   */
-                  If(Exists(Var("ref")), Delete(Var("ref")), {
-                    ref: null,
-                    data: null,
-                  })
-                ),
-                { ref: null, data: null }
-              )
+          await fauna.query<FaunaResult>(
+            fqlTemplates.doOnIndex(
+              indices.Account,
+              [providerId, providerAccountId],
+              Delete(Var("ref"))
             )
           )
 
-          if (!ref || !account) return null
-
-          return reshape.account(ref, account)
+          return null
         },
 
         async createSession(user) {
-          const { ref, data: session } = await fauna.query<FaunaResult>(
-            /**
-             * Create a new session document within the sessions collection.
-             * The session document is populated with the passed in parameters.
-             *
-             * The session is intrinsicly linked to the user who instantiated it
-             * through linkage by `user.id`.
-             */
+          const result = await fauna.query<FaunaSessionResult>(
             Create(Collection(collections.Session), {
               data: {
                 userId: user.id,
@@ -402,65 +306,35 @@ export const FaunaAdapter: Adapter<
             })
           )
 
-          return reshape.session(ref, session)
+          if (!result.ref || !result.data) return null
+
+          return reshape.session(result)
         },
 
         async getSession(sessionToken) {
-          const { ref, data: session } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `set` which holds a set of matches against
-                 * the 'session_by_token' index.
-                 *
-                 * The passed in sessionToken is used as the search term.
-                 */
-                set: Match(Index(indices.Session), sessionToken),
-              },
-              /**
-               * Then, if a member of the set holds a reference to a valid session document, get that document.
-               * Else, return a nullish return object.
-               */
-              If(Exists(Var("set")), Get(Var("set")), { ref: null, data: null })
+          const result = await fauna.query<FaunaSessionResult>(
+            fqlTemplates.doOnIndex(
+              indices.Session,
+              [sessionToken],
+              Get(Var("ref"))
             )
           )
 
-          if (!ref || !session) return null
+          if (!result.ref || !result.data) return null
 
-          /**
-           * Verify that the session has not expired.
-           * If expired, delete the related fauna session document and return null.
-           *
-           * Fauna returns Time as an object of shape: {value: ISOString}.
-           * The `expires` property is returned as an object with this shape.
-           * Hence, a new date is constructed with an ISOString derived from
-           * the `expires` property's value.
-           */
-          if (new Date(session.expires.value) < new Date()) {
-            await fauna.query<FaunaResultOrNull>(
-              Let(
-                {
-                  /**
-                   * Define a local fauna variable `ref`, which holds a reference to the session's
-                   * fauna document within the sessions collection.
-                   */
-                  ref: Ref(Collection(collections), ref),
-                },
-                /**
-                 * Then, if the reference points to a valid session document, delete that document.
-                 * Else, return a nullish return object.
-                 */
-                If(Exists(Var("ref")), Delete(Var("ref")), {
-                  ref: null,
-                  data: null,
-                })
+          if (new Date(result.data.expires.value) < new Date()) {
+            await fauna.query<FaunaSessionResult>(
+              fqlTemplates.doOnRef(
+                collections.Session,
+                result.ref,
+                Delete(Var("ref"))
               )
             )
 
             return null
           }
 
-          return reshape.session(ref, session)
+          return reshape.session(result)
         },
 
         async updateSession(session, force) {
@@ -472,100 +346,38 @@ export const FaunaAdapter: Adapter<
             return null
           }
 
-          const {
-            ref,
-            data: newSession,
-          } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `ref`, which holds a reference to the session's
-                 * fauna document within the sessions collection.
-                 *
-                 * The session id is equal to the fauna document reference for that session document.
-                 */
-                ref: Ref(Collection(collections.Session), session.id),
-              },
-              /**
-               * Then, if the reference points to a valid session document, update that document
-               * data `expires` property to refresh the duration of the session.
-               * Else, return a nullish return object.
-               */
-              If(
-                Exists(Var("ref")),
-                Update(Var("ref"), {
-                  data: {
-                    expires: dateToFaunaTimeOrNull(
-                      new Date(Date.now() + sessionMaxAgeMs)
-                    ),
-                  },
-                }),
-                { ref: null, data: null }
-              )
+          const result = await fauna.query<FaunaSessionResult>(
+            fqlTemplates.doOnRef(
+              collections.User,
+              session.id,
+              Update(Var("ref"), {
+                data: {
+                  expires: dateToFaunaTimeOrNull(
+                    new Date(Date.now() + sessionMaxAgeMs)
+                  ),
+                },
+              })
             )
           )
 
-          if (!ref || !newSession) return null
+          if (!result.ref || !result.data) return null
 
-          return reshape.session(ref, newSession)
+          return reshape.session(result)
         },
 
         async deleteSession(sessionToken) {
-          const { ref, data: session } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 * Define a local fauna variable `set` which holds a set of matches against
-                 * the 'session_by_token' index.
-                 *
-                 * The passed in sessionToken forms the search terms.
-                 */
-                set: Match(Index(indices.Session), sessionToken),
-              },
-              /**
-               * Then, if a member of the set holds a reference to a valid session document, continue.
-               * Else, return a nullish return object.
-               */
-              If(
-                Exists(Var("set")),
-                Let(
-                  {
-                    /**
-                     * Define a local fauna variable `ref` which holds a reference to the session's
-                     * fauna document.
-                     *
-                     * We select the first document reference within the index matches set.
-                     */
-                    ref: Select(0, Paginate(Var("set"))),
-                  },
-                  /**
-                   * Then, if the reference points to a valid session document, delete that document.
-                   * Else, return a nullish return object.
-                   */
-                  If(Exists(Var("ref")), Delete(Var("ref")), {
-                    ref: null,
-                    data: null,
-                  })
-                ),
-                { ref: null, data: null }
-              )
+          await fauna.query<FaunaSessionResult>(
+            fqlTemplates.doOnIndex(
+              indices.Session,
+              [sessionToken],
+              Delete(Var("ref"))
             )
           )
-
-          if (!ref || !session) return null
-
-          return reshape.account(ref, session)
+          return null
         },
 
         async createVerificationRequest(identifier, url, token, _, provider) {
-          const {
-            ref,
-            data: verificationRequest,
-          } = await fauna.query<FaunaResult>(
-            /**
-             * Create a new verification request document within the verification_requests collection.
-             * The verification request document is populated with the passed in parameters.
-             */
+          await fauna.query<FaunaVerificationRequestResult>(
             Create(Collection(collections.VerificationRequest), {
               data: {
                 identifier,
@@ -585,110 +397,46 @@ export const FaunaAdapter: Adapter<
             provider,
           })
 
-          return reshape.verificationRequest(ref, verificationRequest)
+          return null
         },
 
         async getVerificationRequest(identifier, token) {
           const hashedToken = hashToken(token)
 
-          const {
-            ref,
-            data: verificationRequest,
-          } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 */
-                set: Match(Index(indices.VerificationRequest), [
-                  identifier,
-                  hashedToken,
-                ]),
-              },
-              /**
-               */
-              If(Exists(Var("set")), Get(Var("set")), { ref: null, data: null })
+          const result = await fauna.query<FaunaVerificationRequestResult>(
+            fqlTemplates.doOnIndex(
+              indices.VerificationRequest,
+              [identifier, hashedToken],
+              Get(Var("ref"))
             )
           )
 
-          if (!ref || !verificationRequest) return null
+          if (!result.ref || !result.data) return null
 
-          /**
-           */
-          if (new Date(verificationRequest.expires.value) < new Date()) {
-            await fauna.query<FaunaResultOrNull>(
-              Let(
-                {
-                  /**
-                   */
-                  set: Match(Index(indices.VerificationRequest), [
-                    identifier,
-                    hashedToken,
-                  ]),
-                },
-                /**
-                 */
-                If(
-                  Exists(Var("set")),
-                  Let(
-                    {
-                      /**
-                       */
-                      ref: Select(0, Paginate(Var("set"))),
-                    },
-                    /**
-                     */
-                    If(Exists(Var("ref")), Delete(Var("ref")), {
-                      ref: null,
-                      data: null,
-                    })
-                  ),
-                  { ref: null, data: null }
-                )
+          if (new Date(result.data.expires.value) < new Date()) {
+            await fauna.query<FaunaVerificationRequestResult>(
+              fqlTemplates.doOnRef(
+                collections.VerificationRequest,
+                result.ref,
+                Delete(Var("ref"))
               )
             )
-
             return null
           }
 
-          return reshape.session(ref, session)
+          return reshape.session(result)
         },
 
         async deleteVerificationRequest(identifier, token) {
-          const { ref, data: session } = await fauna.query<FaunaResultOrNull>(
-            Let(
-              {
-                /**
-                 */
-                set: Match(Index(indices.VerificationRequest), [
-                  identifier,
-                  hashToken(token),
-                ]),
-              },
-              /**
-               */
-              If(
-                Exists(Var("set")),
-                Let(
-                  {
-                    /**
-                     */
-                    ref: Select(0, Paginate(Var("set"))),
-                  },
-                  /**
-                   */
-                  If(Exists(Var("ref")), Delete(Var("ref")), {
-                    ref: null,
-                    data: null,
-                  })
-                ),
-                { ref: null, data: null }
-              )
+          await fauna.query<FaunaVerificationRequestResult>(
+            fqlTemplates.doOnIndex(
+              indices.VerificationRequest,
+              [identifier, hashToken(token)],
+              Delete(Var("ref"))
             )
           )
 
-          if (!ref || !session) return null
-
-          return reshape.account(ref, session)
+          return null
         },
       }
     },
